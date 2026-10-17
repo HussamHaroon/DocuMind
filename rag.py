@@ -1,15 +1,22 @@
-"""DocuMind retrieval + generation. Terminal test: python rag.py "your question"."""
-import os
+"""DocuMind retrieval + generation with a LangGraph self-check loop.
+
+retrieve -> grade -> (relevant) generate
+                |-> (not relevant, first try) rephrase -> retrieve
+                |-> (not relevant, second try) refuse
+Terminal test: python rag.py "your question"."""
 import sys
+from typing import TypedDict
 
 from dotenv import load_dotenv
 from langchain_chroma import Chroma
 from langchain_groq import ChatGroq
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_core.prompts import ChatPromptTemplate
+from langgraph.graph import StateGraph, END
 
 DB_DIR = 'chroma_db'
 TOP_K = 4
+MAX_RETRIES = 1
 # langchain-chroma returns L2 distance: smaller = more similar. Calibrated on the
 # real corpus: on-topic questions land <= ~1.25, off-corpus >= ~1.40, so 1.32
 # sits in the empty gap between them.
@@ -28,6 +35,18 @@ PROMPT = ChatPromptTemplate.from_messages([
      '   "I couldn\'t find this in your documents." and nothing else.\n'
      'Keep answers under 120 words unless asked for more.'),
     ('human', '{context}\n\nQuestion: {question}'),
+])
+
+GRADE_PROMPT = ChatPromptTemplate.from_messages([
+    ('system', 'Judge whether the context passages contain enough information to answer '
+               'the question. Reply with exactly one word: yes or no.'),
+    ('human', 'Question: {question}\n\nContext:\n{context}'),
+])
+
+REPHRASE_PROMPT = ChatPromptTemplate.from_messages([
+    ('system', 'Rewrite the question with different wording but the same meaning, using '
+               'more search-friendly keywords. Reply with only the rewritten question.'),
+    ('human', '{question}'),
 ])
 
 
@@ -54,30 +73,92 @@ def build_context(docs, metas):
     return '\n\n'.join(parts)
 
 
-def answer(question, store=None, llm=None):
-    """Full pipeline: retrieve, guard, generate. Returns (answer_text, sources, scores)."""
-    store = store or load_store()
-    load_dotenv()
-    llm = llm or ChatGroq(model='openai/gpt-oss-20b', temperature=0)
+# ---------------- LangGraph self-check loop ----------------
 
-    docs, scores, metas = retrieve(store, question)
-    if min(scores) > MAX_DISTANCE:
-        # nothing even close in the corpus: refuse without burning an LLM call
-        return NOT_FOUND, [], scores
+class SelfCheckState(TypedDict):
+    question: str
+    docs: list
+    scores: list
+    metas: list
+    relevant: bool
+    retries: int
+    answer_text: str
 
-    chain = PROMPT | llm
-    response = chain.invoke({'context': build_context(docs, metas), 'question': question})
 
-    # citations appended from retrieval metadata: the LLM never writes them,
-    # so it cannot invent a file or page number
+def _citations(metas):
     seen, cited = set(), []
     for meta in metas:
         key = (meta['source'], meta['page'])
         if key not in seen:
             seen.add(key)
             cited.append(f"{meta['source']}, p.{meta['page']}")
-    text = response.content + '\n\nSources: ' + '; '.join(cited)
-    return text, metas, scores
+    return '; '.join(cited)
+
+
+def build_selfcheck_graph(store, llm):
+    def retrieve_node(state):
+        docs, scores, metas = retrieve(store, state['question'])
+        return {'docs': docs, 'scores': scores, 'metas': metas}
+
+    def grade_node(state):
+        # distance guard first: if the best hit is still far, this is off-corpus,
+        # no point asking the LLM about it
+        if not state['scores'] or min(state['scores']) > MAX_DISTANCE:
+            return {'relevant': False}
+        verdict = (GRADE_PROMPT | llm).invoke(
+            {'question': state['question'],
+             'context': build_context(state['docs'], state['metas'])}).content.strip().lower()
+        return {'relevant': verdict.startswith('yes')}
+
+    def rephrase_node(state):
+        new_q = (REPHRASE_PROMPT | llm).invoke({'question': state['question']}).content.strip()
+        print(f'[self-check] retrying with rephrased question: {new_q}')
+        return {'question': new_q, 'retries': state['retries'] + 1}
+
+    def generate_node(state):
+        response = (PROMPT | llm).invoke(
+            {'context': build_context(state['docs'], state['metas']),
+             'question': state['question']})
+        text = response.content + '\n\nSources: ' + _citations(state['metas'])
+        return {'answer_text': text}
+
+    def refuse_node(state):
+        return {'answer_text': NOT_FOUND}
+
+    def route_after_grade(state):
+        if state['relevant']:
+            return 'generate'
+        if state['retries'] < MAX_RETRIES:
+            return 'rephrase'
+        return 'refuse'
+
+    builder = StateGraph(SelfCheckState)
+    builder.add_node('retrieve', retrieve_node)
+    builder.add_node('grade', grade_node)
+    builder.add_node('rephrase', rephrase_node)
+    builder.add_node('generate', generate_node)
+    builder.add_node('refuse', refuse_node)
+    builder.set_entry_point('retrieve')
+    builder.add_edge('retrieve', 'grade')
+    builder.add_conditional_edges('grade', route_after_grade,
+                                  {'generate': 'generate', 'rephrase': 'rephrase',
+                                   'refuse': 'refuse'})
+    builder.add_edge('rephrase', 'retrieve')
+    builder.add_edge('generate', END)
+    builder.add_edge('refuse', END)
+    return builder.compile()
+
+
+def answer(question, store=None, llm=None):
+    """Full pipeline: retrieve, grade, rephrase-retry once, generate. Returns (answer_text, sources, scores)."""
+    store = store or load_store()
+    load_dotenv()
+    llm = llm or ChatGroq(model='openai/gpt-oss-20b', temperature=0)
+
+    graph = build_selfcheck_graph(store, llm)
+    state = graph.invoke({'question': question, 'docs': [], 'scores': [], 'metas': [],
+                          'relevant': False, 'retries': 0, 'answer_text': ''})
+    return state['answer_text'], state['metas'], state['scores']
 
 
 if __name__ == '__main__':

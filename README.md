@@ -39,6 +39,11 @@ Terminal alternative: `python rag.py "what is phishing"`
 - **Generate** asks gpt-oss-20b (temperature 0, Groq API) to answer strictly from the
   retrieved passages. Citations are appended by the app from chunk metadata, so the
   model cannot invent a file or page number.
+- **Self-check loop** (LangGraph): after retrieval, a grader step checks whether the
+  passages actually contain the answer. If not, the question is rephrased with
+  different keywords and retrieval runs once more; only if that also fails does
+  DocuMind refuse. So an awkwardly worded question still gets answered, while truly
+  off-corpus questions never reach the answer step.
 
 ## Evaluation
 
