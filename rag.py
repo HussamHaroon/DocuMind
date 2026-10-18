@@ -38,8 +38,9 @@ PROMPT = ChatPromptTemplate.from_messages([
 ])
 
 GRADE_PROMPT = ChatPromptTemplate.from_messages([
-    ('system', 'Judge whether the context passages contain enough information to answer '
-               'the question. Reply with exactly one word: yes or no.'),
+    ('system', 'Judge whether the context passages contain information relevant to answering '
+               'the question. Be lenient: partial coverage still counts as relevant. '
+               'Reply with exactly one word: yes or no.'),
     ('human', 'Question: {question}\n\nContext:\n{context}'),
 ])
 
@@ -167,6 +168,7 @@ if __name__ == '__main__':
     q = ' '.join(sys.argv[1:])
     text, sources, scores = answer(q)
     print('ANSWER:\n' + text)
-    print('\nSOURCES:')
-    for meta, score in zip(sources, scores):
-        print(f"  {meta['source']} p.{meta['page']}  (distance {score:.3f})")
+    if text.strip() != NOT_FOUND:
+        print('\nSOURCES:')
+        for meta, score in zip(sources, scores):
+            print(f"  {meta['source']} p.{meta['page']}  (distance {score:.3f})")
